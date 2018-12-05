@@ -9,6 +9,8 @@
  * NO WARRANTY OF ANY KIND IS PROVIDED.
  *
  * Modified by Chip McClelland, See Insights LLC, for Simple Sense
+ * 
+ * v1.1
  *
  *******************************************************************************/
 #include <Arduino_LoRaWAN_machineQ.h>
@@ -24,7 +26,7 @@ static const u1_t PROGMEM APPEUI[8]={ 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 
 // This should also be in little endian format, see above.
-static const u1_t PROGMEM DEVEUI[8]={ 0x00, 0xFF, 0x1E, 0xE7, 0x10, 0xB6, 0x76, 0x98 };
+static const u1_t PROGMEM DEVEUI[8]={ 0x00, 0xFF, 0xCA, 0xAF, 0x10, 0xB6, 0x76, 0x98 };
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 
 // This key should be in big endian format (or, since it is not really a
@@ -43,7 +45,7 @@ int sendAttempts = 0;
 int ackedAttempts = 0;
 
 // Pin mapping for Adafruit Feather M0 LoRa, etc.
-const int PIRpin = 9;
+const int PIRpin = A0;
 const int LEDpin = 13;
 volatile bool presenceState = false;
 volatile bool presenceChange = false;
@@ -70,14 +72,14 @@ void setup() {
     os_init();                          // LMIC init
     LMIC_reset();                       // Reset the MAC state. Session and pending data transfers will be discarded.
     LMIC_setAdrMode(1);                 // Enable Adaptive Rate Control - disable if device is mobile.
-    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+    //LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
     do_send(&sendjob);                  // Start job (sending automatically starts OTAA too)
 
     attachInterrupt(PIRpin,sensorISR,RISING);
 }
 
 void loop() {
-    if (millis() - lastPIRevent >= timeout && presenceState) {
+    if ((millis() - lastPIRevent >= timeout) && presenceState) {
       digitalWrite(LEDpin,LOW);
       presenceState = false;
       presenceChange = true;
