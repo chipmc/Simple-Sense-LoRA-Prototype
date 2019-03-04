@@ -10,14 +10,21 @@
  *
  * Modified by Chip McClelland, See Insights LLC, for Simple Sense
  * 
- * v1.1
- *
+ * v1.1 - First Commit
+ * v1.2 - Changed reporting to only on change in occupancy and required ack
+ * v1.3 - Tried updating the clock error - still taking too long to connect
  *******************************************************************************/
-#include <Arduino_LoRaWAN_machineQ.h>
-#include <lmic.h>
+#include <Arduino_LoRaWAN_machineQ.h>     // Tested with v0.5.2 of MCCI LoRAWan Library
+#include <lmic.h>                         // Tested with v2.3.1 of MCCI LMIC Library
 #include <hal/hal.h>
 #include <SPI.h>
 #include <TimeLib.h>
+
+enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, SLEEPING_STATE, NAPPING_STATE, LOW_BATTERY_STATE, REPORTING_STATE, RESP_WAIT_STATE };
+char stateNames[8][14] = {"Initialize", "Error", "Idle", "Sleeping", "Napping", "Low Battery", "Reporting", "Response Wait" };
+State state = INITIALIZATION_STATE;
+State oldState = INITIALIZATION_STATE;
+
 
 // This EUI must be in little-endian format, so least-significant-byte
 // first. When copying an EUI from ttnctl output, this means to reverse
@@ -40,22 +47,28 @@ static osjob_t sendjob;
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 15;
+const unsigned TX_INTERVAL = 10;
+int maxSendAttempts = 5;
 int sendAttempts = 0;
 int ackedAttempts = 0;
 
 // Pin mapping for Adafruit Feather M0 LoRa, etc.
 const int PIRpin = A0;
 const int LEDpin = 13;
+const int RFMresetPin = 4;
+const int RFMchipSelectPin = 8;
+const int RFMgpioPin = 3;
 volatile bool presenceState = false;
 volatile bool presenceChange = false;
+bool ackReceived = false;
+bool joinedState = false;
 volatile unsigned long lastPIRevent = 0;
-unsigned long timeout = 30000;
+unsigned long timeout = 180000;
 const lmic_pinmap lmic_pins = {
-    .nss = 8,
+    .nss = RFMchipSelectPin,
     .rxtx = LMIC_UNUSED_PIN,
-    .rst = 4,
-    .dio = {3, 6, LMIC_UNUSED_PIN},
+    .rst = RFMresetPin,
+    .dio = {RFMgpioPin, 6, LMIC_UNUSED_PIN},
     .rxtx_rx_active = 0,
     .rssi_cal = 8,              // LBT cal for the Adafruit Feather M0 LoRa, in dB
     .spi_freq = 8000000,
@@ -68,31 +81,67 @@ void setup() {
     pinMode(PIRpin,INPUT);
     pinMode(LEDpin,OUTPUT);
     digitalWrite(LEDpin,LOW);
-    
     os_init();                          // LMIC init
     LMIC_reset();                       // Reset the MAC state. Session and pending data transfers will be discarded.
     LMIC_setAdrMode(1);                 // Enable Adaptive Rate Control - disable if device is mobile.
-    //LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+    LMIC_setClockError(MAX_CLOCK_ERROR * 10 / 100);
     do_send(&sendjob);                  // Start job (sending automatically starts OTAA too)
-
+    while (!joinedState) {
+      os_runloop_once();
+      delay(1000);
+    }
+    
     attachInterrupt(PIRpin,sensorISR,RISING);
+
+    state = IDLE_STATE;
 }
 
 void loop() {
-    if ((millis() - lastPIRevent >= timeout) && presenceState) {
-      digitalWrite(LEDpin,LOW);
-      presenceState = false;
-      presenceChange = true;
-    }
-    if (presenceChange) {                 // Schedule next transmission
-      if (presenceState) {
-        Serial.println("Detected");
-        mydata[2] = 0xff;
+  switch (state) {
+    case IDLE_STATE:
+      if(state != oldState) publishStateTransition();
+      if ((millis() - lastPIRevent >= timeout) && presenceState) {
+        digitalWrite(LEDpin,LOW);
+        presenceState = false;
+        presenceChange = true;
       }
-      else mydata[2] = 0x00;
-      presenceChange = false;
-    }
-    os_runloop_once();
+      if (presenceChange) {
+        if (presenceState) {
+          Serial.println("Occupancy");
+          mydata[2] = 0xff;
+        }
+        else {
+          Serial.println("No occupancy");
+          mydata[2] = 0x00;
+        }
+        state = REPORTING_STATE;
+      }
+      break;
+    case REPORTING_STATE:
+      publishStateTransition();
+      os_runloop_once();
+      os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);  // Schedule the next event
+           //do_send(&sendjob);                  // Start job (sending automatically starts OTAA too)
+
+       state = RESP_WAIT_STATE;
+      break;
+    case RESP_WAIT_STATE: 
+      publishStateTransition();
+      if (ackReceived) state = IDLE_STATE;
+      else {
+        delay(10000);                    // Don't retransmit too often
+        state = REPORTING_STATE;         // Try again until we get ACK
+      }
+      break;
+    case ERROR_STATE:
+      publishStateTransition();
+      digitalWrite(RFMresetPin,LOW);
+      delay(100);
+      digitalWrite(RFMresetPin,HIGH);
+      os_init();                          // LMIC init
+      LMIC_reset();                       // Reset the MAC state. Session and pending data transfers will be discarded.
+      break;
+  }
 }
 
 
@@ -139,6 +188,7 @@ void onEvent (ev_t ev) {
         case EV_JOINED:
             Serial.println(F("EV_JOINED"));
             LMIC_setLinkCheckMode(0);
+            joinedState = true;
             break;
         case EV_JOIN_FAILED:
             Serial.println(F("EV_JOIN_FAILED"));
@@ -154,7 +204,7 @@ void onEvent (ev_t ev) {
               float percentAcked = ((float)ackedAttempts / (float)sendAttempts) * 100.0;
               Serial.print(percentAcked);
               Serial.print("%");
-              // presenceChange = false;
+              ackReceived = true;
             }
             if (LMIC.dataLen) {
               Serial.print(F(" and "));
@@ -194,8 +244,8 @@ void onEvent (ev_t ev) {
 }
 
 
-void sensorISR() {
-  if (millis() - lastPIRevent >= timeout || !presenceState) {
+void sensorISR() {                             // Interrupt handler for PIR sensor event
+  if (!presenceState) {
     presenceState = true;
     presenceChange = true;
     digitalWrite(LEDpin,HIGH);  
@@ -203,19 +253,23 @@ void sensorISR() {
   lastPIRevent = millis();
 }
 
-void digitalClockDisplay(){
-  // digital clock display of the time
+void digitalClockDisplay() {                   // Displayed time since last reset for logging
   Serial.print(hour());
   printDigits(minute());
   printDigits(second());
 }
 
-void printDigits(int digits){
-  // utility function for digital clock display: prints preceding colon and leading 0
+void printDigits(int digits) {                 // utility function for digital clock display: prints preceding colon and leading 0
   Serial.print(":");
   if(digits < 10)
     Serial.print('0');
   Serial.print(digits);
 }
 
-
+void publishStateTransition(void)
+{
+  char stateTransitionString[40];
+  snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
+  oldState = state;
+  Serial.println(stateTransitionString);
+}
